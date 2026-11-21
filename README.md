@@ -1,7 +1,7 @@
-# Liquid-Codec decoder on the Apple Neural Engine
+# Liquid-Codec on the Apple Neural Engine
 
-A Core ML conversion of the decoder of [Liquid AI's Liquid-Codec](https://huggingface.co/LiquidAI/Liquid-Codec) (24 kHz speech codec, 12 codebooks at
-12.5 frames/s), built to run on the Apple Neural Engine (ANE). It turns Liquid-Codec codes into 24 kHz audio.
+A Core ML conversion of [Liquid AI's Liquid-Codec](https://huggingface.co/LiquidAI/Liquid-Codec) (24 kHz speech codec, 12 codebooks at
+12.5 frames/s). The original packages are the decoder only, in a fixed 40-frame window. `models/stream/` adds the encoder and decoder windows of 1, 2, and 4 new frames for a real-time call.
 
 **Licence:** the model weights and the decoder design are Liquid AI's and are used under the **LFM Open License v1.0**
 (`LICENSE-LFM-Open-v1.0.txt`). That includes its commercial-use limit (Section 5: commercial use is licensed only below USD 10M annual revenue).
@@ -44,7 +44,8 @@ Neural Engine (Core ML compute plan). The first call after loading compiles for 
 - `convert/lc_ane.py`: re-implementation and conversion (`check` compares against Liquid's PyTorch model; `convert` writes the .mlpackage).
   `convert/export_tail.py` writes the tail file.
 - `examples/decode_wav.py`: Python, wav -> codes (Liquid's PyTorch encoder) -> ANE decode -> wav, with `--compare`.
-- `examples/swift/`: a standalone Swift decoder (`LiquidANEDecoder`) and a CLI: codes (int32 [12, T]) -> 24 kHz wav.
+- `examples/swift/`: a Swift decoder and, with `liquidcodec stream`, a streaming encoder plus decoder. The legacy `liquidcodec MODELS CODES.bin T OUT.wav` path still drives the 40-frame package.
+- `models/liquidcodec.json` and `models/stream/`: the one-frame encoder and the 1-, 2-, and 4-frame decoders. See Streaming below. The 40-frame packages in this list are unchanged.
 - `samples/`: seven real human recordings in seven languages, each as `*_original.flac` and `*_ane_int8.flac` (see Samples), plus `codes_example.npy` (the English clip's codes).
 
 ## Samples
@@ -93,8 +94,70 @@ xcrun coremlcompiler compile lc_dec_ane.mlpackage models/
 python convert/export_tail.py /path/to/Liquid-Codec models/lc_tail_f32.bin
 ```
 
+## Streaming encoder and smaller decoder windows
+
+The 40-frame decoder above is unchanged. A call needs an encoder and a much shorter decoder step. Both are in `models/stream/`, described by `models/liquidcodec.json`.
+
+The encoder is a one-frame Core ML step, not a stateless window. Liquid's encoder attention is causal over the whole clip (the decoder's attention is the 30-frame slide; the encoder's is not). A fixed left context therefore does not reproduce Liquid's codes: at 20 frames of context and no lookahead, code match on a 16 s clip was about 32% and the decoded audio was about 3.5 dB SNR against decoding the true codes. With 480 samples of real lookahead and 120 frames of context it was still about 90% of code values and about half of frames. Stepping one frame at a time, with the conv state and the attention keys kept, matches Liquid's `encode()` exactly in fp32.
+
+Each encoder call takes **2400 samples**: the 80 ms codec frame plus **480 samples (20 ms)** that the analysis window hangs into the next frame. The first call uses the same left reflect pad as Liquid's `encode()`. The cache holds 4096 frames (327.68 s). Past that, the oldest keys are replaced and the match is no longer exact. The cache is not delay.
+
+Algorithmic latency for `new_frames=1`, not including Core ML runtime or a jitter buffer:
+
+| piece | time |
+|---|---|
+| collect one codec frame | 80 ms |
+| analysis lookahead | 20 ms |
+| receiver collect | 0 (one packet) |
+| decoder overlap-add holdback | 20 ms |
+| **end to end** | **120 ms** |
+
+The WebRTC glue's own formula (sender collect + receiver collect + 20 ms tail, no encoder lookahead) is 100 ms for `new_frames=1`. The extra 20 ms is the analysis lookahead above. `new_frames` of 2 or 4 are separate decoder packages (`lc_dec_n2_*`, `lc_dec_n4_*`); the glue's formula then adds `(new_frames - 1) * 80` ms of receiver collect. The shipped manifest uses `new_frames=1`.
+
+The decoder stays stateless. Its receptive field is 117 frames at 75 Hz, and 20 codec frames of left context are 120 frames at that rate, so a chunk matches a full decode. Measured in fp32 against Liquid's model (63 random code frames): hidden-state max abs about 3e-5, audio SNR about 100 dB, and a negative control that drops the left context differs by about 5. A KV cache would not change those samples. The packages are fp16 and weight-only int8. The int8 encoder quantizes the LFM stack only; the STFT, the front end, and the FSQ head stay fp16. A PyTorch stand-in of that split, on the English sample, kept 98.9% of code values and 87% of frames. Quantizing every weight dropped that to 75.6% of codes and 9% of frames. Those int8 figures are not Core ML predictions.
+
+Core ML **prediction was not run** (this conversion ran on Linux). Do not treat the table above as an ANE speed or an on-device SNR. The fp32 code match was run here; the founder checks the packages on an M-series Mac with the commands below.
+
+### What the WebRTC glue must change
+
+`scripts/liquidcodec/fetch_models.sh` in wilddolphin2025/webrtcsays.ai already copies `models/` and reads `liquidcodec.json`. The decoder side of that manifest matches the glue as it stands: `ctx_frames=20`, `new_frames=1`, inputs `lat` and `valid`, output `hidden`, tail `lc_tail_f32.bin`. The encoder does not. `encoder_window` is `"new"`, but the call is not `new_frames * 1920` samples and it is not a single `audio` tensor.
+
+In `modules/audio_coding/codecs/liquidcodec/liquid_coreml.mm`:
+
+1. Read `lookahead_samples` (480), `encoder_input_samples` (2400), and `encoder_cache_frames` from the manifest. The glue's parser currently ignores unknown keys, so those fields have to be added next to `encoder_window`.
+2. `Start()`: the encoder input `audio` has last dimension 2400, not `new_frames * frame_samples`. Also require inputs `hist` `[1,1,1,1120]`, `k_cache` and `v_cache` `[3,2,64,cache]`, `conv_state` `[5,512,6]`, `pos` `[1]`, all kept by the backend and zeroed in `Reset()`.
+3. `EncodeWindow`: take the last 1920 samples of the new audio plus 480 samples of lookahead. `StreamEncoder::Push` must not call the model until those 480 samples have arrived (hold the frame, do not reflect-pad it). Run the prediction with the five state tensors, read `codes` (integer-valued float, shape `[1,12,1,1]`), and replace the state with `hist_out`, `k_cache_out`, `v_cache_out`, `conv_state_out`, `pos_out`.
+4. Leave `DecodeWindow` as it is. For `new_frames=1` it already builds a 21-frame latent and a 126-long validity mask and keeps the last 6 hidden frames at 75 Hz.
+
+Until that patch, pointing the glue at this manifest fails the encoder shape check on purpose. Decoder-only use of `stream/lc_dec_n1_int8.mlpackage` with `--liquid-ctx 20 --liquid-new 1` matches the code that is already there.
+
+### Build and Mac check
+
+```
+# any machine: PyTorch reference. LIQUID_DIR is a checkout of the HF repo at b5abfac
+python convert/lc_step.py check "$LIQUID_DIR"          # codes equal Liquid encode()
+python convert/lc_ane.py check "$LIQUID_DIR" --ctx 20 --new 1
+python examples/stream_wav.py --wav samples/hi_rasa_original.flac --out /tmp/out.wav --compare --liquid "$LIQUID_DIR"
+
+# rebuild the packages (coremltools converts on Linux; it does not predict there)
+python convert/build_models.py "$LIQUID_DIR" models/stream
+
+# Mac, Apple silicon, macOS 15+. Prediction and the ANE are only measurable here.
+python examples/stream_wav.py --coreml --models models --units cpu \
+    --wav samples/hi_rasa_original.flac --out /tmp/cpu.wav --compare --liquid "$LIQUID_DIR"
+python examples/stream_wav.py --coreml --models models --units ane \
+    --wav samples/hi_rasa_original.flac --out /tmp/ane.wav --compare --liquid "$LIQUID_DIR"
+swiftc -O -o liquidcodec examples/swift/LiquidManifest.swift examples/swift/LiquidANEDecoder.swift \
+    examples/swift/LiquidANEEncoder.swift examples/swift/main.swift
+./liquidcodec stream models samples/hi_rasa_original.flac /tmp/swift.wav
+# optional: xcrun compile, if a caller wants .mlmodelc instead of .mlpackage
+bash scripts/compile_models.sh models/stream
+```
+
+`stream_wav.py --compare` prints the code match against Liquid and the SNR of the chunked fp32 decode. `--coreml` loads the fp16 step package; on Linux that load does not predict.
+
 ## Limits
-- Decoder only. The encoder is not converted; use Liquid's PyTorch encoder to get codes.
-- Not bit-exact: fp16 is ~39 dB and int8 ~28 dB SNR against fp32 (int8 judged unchanged by ear, n=6).
+- The legacy 40-frame packages are still decoder-only. The streaming encoder is `models/stream/lc_enc_step_*.mlpackage`.
+- Not bit-exact on device: the fp16 decoder was ~39 dB and int8 ~28 dB SNR against fp32 on the 40-frame package (int8 judged unchanged by ear, n=6). The new windows were checked in fp32 only. The streaming encoder matches Liquid's codes in fp32; the fp16 and int8 packages were not executed here.
 - Numbers come from one machine (M3 Air) and one set of 10 clips. Other chips will differ. The first call per process includes ANE compilation.
 - macOS 15 or later (the package targets macOS 15).

@@ -9,9 +9,16 @@ public final class LiquidANEDecoder: @unchecked Sendable {
     let W: [Float], b: [Float]                      // lin [1282, 512] row-major, bias [1282]
     let basis: [Float]                              // [1280, 1282]: windowed inverse real DFT for [Re(641); Im(641)]
     let env: [Float]                                // window^2 for overlap-add
-    static let CTX = 20, NEW = 20, FR = 40, T75 = 240, NB = 641, NF = 1280, HOP = 320, LV = [8, 7, 6, 6]
+    /// Codec frames of left context and of new audio. The legacy package is 20 + 20.
+    public let ctx: Int
+    public let newFrames: Int
+    public var fr: Int { ctx + newFrames }
+    public var t75: Int { fr * 6 }
+    static let NB = 641, NF = 1280, HOP = 320, LV = [8, 7, 6, 6]
 
-    public init(dir: URL, model: String = "lc_dec_ane_int8.mlmodelc", units: MLComputeUnits = .cpuAndNeuralEngine) throws {
+    public init(dir: URL, model: String = "lc_dec_ane_int8.mlmodelc", ctx: Int = 20, newFrames: Int = 20, units: MLComputeUnits = .cpuAndNeuralEngine) throws {
+        self.ctx = ctx
+        self.newFrames = newFrames
         let c = MLModelConfiguration(); c.computeUnits = units
         dec = try MLModel(contentsOf: dir.appendingPathComponent(model), configuration: c)
         let d = try Data(contentsOf: dir.appendingPathComponent("lc_tail_f32.bin"))
@@ -62,16 +69,16 @@ public final class LiquidANEDecoder: @unchecked Sendable {
     public func audio(_ lat: [Float], T: Int, read: (MLMultiArray) -> [Float], onChunk: ([Float]) -> Void) throws {
         let n75 = T * 6, total = (n75 - 1) * Self.HOP + Self.NF
         var acc = [Float](repeating: 0, count: total), en = [Float](repeating: 0, count: total); var emitted = 480
-        let la = try MLMultiArray(shape: [1, 48, 1, NSNumber(value: Self.FR)], dataType: .float16), va = try MLMultiArray(shape: [1, 1, 1, NSNumber(value: Self.T75)], dataType: .float16)
-        let lp = la.dataPointer.bindMemory(to: Float16.self, capacity: 48 * Self.FR), vp = va.dataPointer.bindMemory(to: Float16.self, capacity: Self.T75)
+        let la = try MLMultiArray(shape: [1, 48, 1, NSNumber(value: fr)], dataType: .float16), va = try MLMultiArray(shape: [1, 1, 1, NSNumber(value: t75)], dataType: .float16)
+        let lp = la.dataPointer.bindMemory(to: Float16.self, capacity: 48 * fr), vp = va.dataPointer.bindMemory(to: Float16.self, capacity: t75)
         var s = 0
         while s < T {
-            for c in 0..<48 { for f in 0..<Self.FR { let g = s - Self.CTX + f; lp[c * Self.FR + f] = (g >= 0 && g < T) ? Float16(lat[c * T + g]) : 0 } }
-            for f in 0..<Self.T75 { let g = s - Self.CTX + f / 6; vp[f] = (g >= 0 && g < T) ? 1 : 0 }
-            let hid = try autoreleasepool { read(try dec.prediction(from: MLDictionaryFeatureProvider(dictionary: ["lat": la, "valid": va])).featureValue(for: "hidden")!.multiArrayValue!) }   // [512, 240]
-            let keep = min(Self.NEW, T - s) * 6, c0 = Self.CTX * 6
+            for c in 0..<48 { for f in 0..<fr { let g = s - ctx + f; lp[c * fr + f] = (g >= 0 && g < T) ? Float16(lat[c * T + g]) : 0 } }
+            for f in 0..<t75 { let g = s - ctx + f / 6; vp[f] = (g >= 0 && g < T) ? 1 : 0 }
+            let hid = try autoreleasepool { read(try dec.prediction(from: MLDictionaryFeatureProvider(dictionary: ["lat": la, "valid": va])).featureValue(for: "hidden")!.multiArrayValue!) }
+            let keep = min(newFrames, T - s) * 6, c0 = ctx * 6
             var hk = [Float](repeating: 0, count: 512 * keep)
-            for c in 0..<512 { for j in 0..<keep { hk[c * keep + j] = hid[c * Self.T75 + c0 + j] } }
+            for c in 0..<512 { for j in 0..<keep { hk[c * keep + j] = hid[c * t75 + c0 + j] } }
             // y [1282, keep] = W hk + b
             var y = [Float](repeating: 0, count: 1282 * keep)
             for r in 0..<1282 { for j in 0..<keep { y[r * keep + j] = b[r] } }
@@ -87,7 +94,7 @@ public final class LiquidANEDecoder: @unchecked Sendable {
                 let f0 = (s * 6 + j) * Self.HOP
                 for t in 0..<Self.NF { acc[f0 + t] += fr[t * keep + j]; en[f0 + t] += env[t] }
             }
-            s += Self.NEW
+            s += newFrames
             let ready = s >= T ? total - 480 : s * 6 * Self.HOP              // samples before the next frame's start are final
             if ready > emitted { onChunk((emitted..<ready).map { acc[$0] / en[$0] }); emitted = ready }
         }
