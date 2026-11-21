@@ -16,8 +16,8 @@ equals the full-sequence output up to rounding. A `valid` input (1 at real frame
 at the sequence start: it zeroes the conv input and masks attention keys.
 
 usage:
-  python lc_ane.py check  MODEL_DIR            # fp32 torch: chunked vs full, vs HF if transformers is present; act stats
-  python lc_ane.py convert MODEL_DIR OUT.mlpackage
+  python lc_ane.py check  MODEL_DIR [--ctx 20 --new 1]   # fp32: chunked vs full, vs Liquid if transformers imports
+  python lc_ane.py convert MODEL_DIR OUT.mlpackage [--ctx 20 --new 1]
 """
 import json, math, os, sys
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
@@ -56,9 +56,9 @@ def c1(w, b=None):
 
 
 class Layer(nn.Module):
-    def __init__(self, sd, i, scales):
+    def __init__(self, sd, i, scales, prefix="decoder.lfm.layers."):
         super().__init__()
-        p = f"decoder.lfm.layers.{i}."
+        p = f"{prefix}{i}."
         self.att = i in ATT
         g = lambda n: sd[p + n]
         self.n_op = RMS(g("operator_norm.weight"), 1, scales.get(f"{i}.op", 1.0))
@@ -170,90 +170,141 @@ def latent_from_codes(codes):                   # codes (12, F) int -> (48, F) f
     return lat.reshape(codes.shape[1], 48).T.astype(np.float32)
 
 
-def chunks(lat):                                # lat (48, Ftot) -> list of (lat_win (1,48,1,FR), valid (1,1,1,T), keep_frames)
-    Ft = lat.shape[1]; out = []
-    pad = np.zeros((48, CTX), np.float32)
-    L = np.concatenate([pad, lat, np.zeros((48, NEW), np.float32)], 1)
-    for s in range(0, Ft, NEW):
-        w = L[:, s:s + FR]
-        idx = np.arange(s - CTX, s - CTX + FR)
+def chunks(lat, ctx=None, new=None):           # lat (48, Ftot) -> (lat_win (1,48,1,FR), valid (1,1,1,T75), keep_75)
+    ctx = CTX if ctx is None else int(ctx); new = NEW if new is None else int(new)
+    fr = ctx + new; Ft = lat.shape[1]; out = []
+    pad = np.zeros((48, ctx), np.float32)
+    L = np.concatenate([pad, lat, np.zeros((48, new), np.float32)], 1)
+    for s in range(0, Ft, new):
+        w = L[:, s:s + fr]
+        idx = np.arange(s - ctx, s - ctx + fr)
         v = ((idx >= 0) & (idx < Ft)).astype(np.float32).repeat(6)
-        keep = min(NEW, Ft - s) * 6
+        keep = min(new, Ft - s) * 6
         out.append((w[None, :, None], v[None, None, None], keep))
     return out
 
 
-def run_chunked(fn, lat):                       # fn(lat_win, valid) -> hidden (512, T) ; returns (512, Ftot*6)
+def run_chunked(fn, lat, ctx=None, new=None):   # fn(lat_win, valid) -> hidden (512, T75) ; returns (512, Ftot*6)
+    ctx = CTX if ctx is None else int(ctx)
     hs = []
-    for w, v, keep in chunks(lat):
+    for w, v, keep in chunks(lat, ctx, new):
         h = fn(w, v)
-        hs.append(h[:, CTX * 6: CTX * 6 + keep])
+        hs.append(h[:, ctx * 6: ctx * 6 + keep])
     return np.concatenate(hs, 1)
 
 
-def main():
-    mode, mdir = sys.argv[1], sys.argv[2]
+def snr_db(ref, est):
+    n = min(len(ref), len(est)); e = np.asarray(est[:n], np.float64) - np.asarray(ref[:n], np.float64)
+    p = float(np.square(np.asarray(ref[:n], np.float64)).sum()); d = float(np.square(e).sum())
+    return float(10 * np.log10(p / max(d, 1e-20)))
+
+
+def scales_from_stats(st):
+    """Power-of-two RMSNorm prescale so the scaled activation stays <= 32 and fp16 x^2 cannot overflow."""
+    scales = {}
+    for i in range(8):
+        for nm, key in (("op", "in"), ("ffn", "mid"), ("pop", "op"), ("pffn", "ffo")):
+            mx = st.get(f"{i}.{key}", 1.0)
+            scales[f"{i}.{nm}"] = 2.0 ** -max(0, math.ceil(math.log2(max(mx, 1e-6) / 32)))
+    scales["final"] = 2.0 ** -max(0, math.ceil(math.log2(max(st.get("final.in", 1.0), 1e-6) / 32)))
+    return scales
+
+
+def check_decoder(mdir, ctx=CTX, new=NEW, ft=63, seed=0):
+    """Chunked fp32 reimplementation versus a full pass, and versus Liquid's model when it imports."""
     torch.set_num_threads(int(os.environ.get("NT", "4")))
     sd = load_sd(mdir)
-    torch.manual_seed(0)
-    if mode == "check":
-        g = np.random.default_rng(0)
-        Ft = 63
-        codes = g.integers(0, 2016, (12, Ft))
-        lat = latent_from_codes(codes)
-        full = DecANE(sd, n=Ft * 6).eval()
-        with torch.no_grad():
-            hf_full = full(torch.from_numpy(lat)[None, :, None], torch.ones(1, 1, 1, Ft * 6))[0, :, 0].numpy()
-            m = DecANE(sd).eval(); stats = {}
-            fn = lambda w, v: m(torch.from_numpy(w), torch.from_numpy(v), stats)[0, :, 0].numpy()
-            ch = run_chunked(fn, lat)
-            # negative control: too little context must differ
-            res = dict(chunk_vs_full_maxabs=float(np.abs(ch - hf_full).max()), hid_absmax=float(np.abs(hf_full).max()))
-            try:
-                sys.path.insert(0, os.path.dirname(os.path.abspath(mdir)))
-                from transformers import AutoModel
-                ref = AutoModel.from_pretrained(mdir, trust_remote_code=True, dtype=torch.float32).eval()
-                ct = torch.from_numpy(codes)[None]
-                emb = ref.from_quantizer(ref.quantizer.decode(ct).mT)
-                hid = ref.decoder.lfm(inputs_embeds=F.interpolate(emb.mT, emb.shape[1] * 6, mode="nearest-exact").mT,
-                                      use_cache=False).last_hidden_state[0].T.numpy()
-                res["mine_full_vs_hf_hidden_maxabs"] = float(np.abs(hf_full - hid).max())
-                tail = Tail(sd)
-                a_ref = ref.decode(ct).audio_values[0].numpy(); a_me = tail.audio(ch)
-                res["audio_ref_vs_mine_chunked_maxabs"] = float(np.abs(a_ref - a_me).max())
-                res["audio_ref_absmax"] = float(np.abs(a_ref).max())
-            except Exception as e:
-                res["hf"] = f"skipped: {type(e).__name__}: {e}"
-            # negative control: drop the context (CTX frames all invalid) -> must differ from full
-            def fn0(w, v):
-                v = v.copy(); v[..., :CTX * 6] = 0
-                return m(torch.from_numpy(w), torch.from_numpy(v))[0, :, 0].numpy()
-            res["negctl_noctx_vs_full_maxabs"] = float(np.abs(run_chunked(fn0, lat) - hf_full).max())
-            res["stats"] = stats
-        print(json.dumps(res, indent=1)); json.dump(res, open("check.json", "w"), indent=1)
-    elif mode == "convert":
-        import coremltools as ct
-        st = json.load(open("check.json"))["stats"]
-        # prescale each norm so the scaled max |x| is <= 32 (x^2 mean stays far below fp16 max)
-        scales = {}
-        for i in range(8):
-            for nm, key in (("op", "in"), ("ffn", "mid"), ("pop", "op"), ("pffn", "ffo")):
-                mx = st.get(f"{i}.{key}", 1.0)
-                scales[f"{i}.{nm}"] = 2.0 ** -max(0, math.ceil(math.log2(max(mx, 1e-6) / 32)))
-        scales["final"] = 2.0 ** -max(0, math.ceil(math.log2(st["final.in"] / 32)))
-        m = DecANE(sd, scales=scales).eval()
-        lat = torch.zeros(1, 48, 1, FR); val = torch.ones(1, 1, 1, T)
-        tr = torch.jit.trace(m, (lat, val))
-        ml = ct.convert(tr, inputs=[ct.TensorType("lat", (1, 48, 1, FR), dtype=np.float16),
-                                    ct.TensorType("valid", (1, 1, 1, T), dtype=np.float16)],
-                        outputs=[ct.TensorType("hidden", dtype=np.float16)],
-                        convert_to="mlprogram", compute_precision=ct.precision.FLOAT16,
-                        minimum_deployment_target=ct.target.macOS15, compute_units=ct.ComputeUnit.CPU_ONLY)
-        ml.short_description = f"Liquid-Codec decoder LFM stack, fp16, CTX={CTX} NEW={NEW} codec frames; tail on CPU fp32"
-        ml.save(sys.argv[3])
-        # fp16 numeric check on CPU via coremltools is macOS-only; on Linux report the torch fp16-free path only
-        json.dump(dict(scales=scales), open(sys.argv[3] + ".scales.json", "w"), indent=1)
-        print("SAVED", sys.argv[3], scales)
+    g = np.random.default_rng(seed)
+    codes = g.integers(0, 2016, (12, ft))
+    lat = latent_from_codes(codes)
+    full = DecANE(sd, n=ft * 6).eval()
+    with torch.no_grad():
+        hf_full = full(torch.from_numpy(lat)[None, :, None], torch.ones(1, 1, 1, ft * 6))[0, :, 0].numpy()
+        m = DecANE(sd, n=(ctx + new) * 6).eval(); stats = {}
+        fn = lambda w, v: m(torch.from_numpy(w), torch.from_numpy(v), stats)[0, :, 0].numpy()
+        ch = run_chunked(fn, lat, ctx, new)
+        res = dict(ctx_frames=ctx, new_frames=new, frames=ft,
+                   chunk_vs_full_maxabs=float(np.abs(ch - hf_full).max()),
+                   hid_absmax=float(np.abs(hf_full).max()))
+        tail = Tail(sd)
+        a_full = tail.audio(hf_full); a_ch = tail.audio(ch)
+        res["audio_chunk_vs_full_maxabs"] = float(np.abs(a_ch - a_full).max())
+        res["audio_chunk_vs_full_snr_db"] = snr_db(a_full, a_ch)
+        try:
+            from transformers import AutoModel
+            ref = AutoModel.from_pretrained(mdir, trust_remote_code=True, dtype=torch.float32).eval()
+            ct = torch.from_numpy(codes)[None]
+            emb = ref.from_quantizer(ref.quantizer.decode(ct).mT)
+            hid = ref.decoder.lfm(inputs_embeds=F.interpolate(emb.mT, emb.shape[1] * 6, mode="nearest-exact").mT,
+                                  use_cache=False).last_hidden_state[0].T.numpy()
+            res["mine_full_vs_hf_hidden_maxabs"] = float(np.abs(hf_full - hid).max())
+            a_ref = ref.decode(ct).audio_values[0].numpy()
+            res["audio_ref_vs_mine_chunked_maxabs"] = float(np.abs(a_ref - a_ch).max())
+            res["audio_ref_vs_mine_chunked_snr_db"] = snr_db(a_ref, a_ch)
+            res["audio_ref_absmax"] = float(np.abs(a_ref).max())
+        except Exception as e:
+            res["hf"] = f"skipped: {type(e).__name__}: {e}"
+
+        def fn0(w, v):
+            v = v.copy(); v[..., :ctx * 6] = 0
+            return m(torch.from_numpy(w), torch.from_numpy(v))[0, :, 0].numpy()
+        res["negctl_noctx_vs_full_maxabs"] = float(np.abs(run_chunked(fn0, lat, ctx, new) - hf_full).max())
+        res["stats"] = stats
+        res["scales"] = scales_from_stats(stats)
+    return res
+
+
+def convert_decoder(mdir, out_path, ctx=CTX, new=NEW, scales=None):
+    """Write an fp16 mlpackage. `scales` is the prescale dict from check_decoder."""
+    import coremltools as ct
+    sd = load_sd(mdir)
+    if scales is None:
+        scales = check_decoder(mdir, ctx, new)["scales"]
+    fr, t75 = ctx + new, (ctx + new) * 6
+    m = DecANE(sd, n=t75, scales=scales).eval()
+    lat = torch.zeros(1, 48, 1, fr); val = torch.ones(1, 1, 1, t75)
+    tr = torch.jit.trace(m, (lat, val))
+    ml = ct.convert(tr, inputs=[ct.TensorType("lat", (1, 48, 1, fr), dtype=np.float16),
+                                ct.TensorType("valid", (1, 1, 1, t75), dtype=np.float16)],
+                    outputs=[ct.TensorType("hidden", dtype=np.float16)],
+                    convert_to="mlprogram", compute_precision=ct.precision.FLOAT16,
+                    minimum_deployment_target=ct.target.macOS15, compute_units=ct.ComputeUnit.CPU_ONLY)
+    ml.short_description = (f"Liquid-Codec decoder LFM stack, fp16, ctx={ctx} new={new} codec frames "
+                            f"({fr} frames, {t75} at 75 Hz). Tail stays on the CPU in fp32. "
+                            f"Liquid AI weights, LFM Open License v1.0.")
+    ml.author = "Liquid AI, Inc. (weights); Core ML conversion"
+    ml.license = "LFM Open License v1.0"
+    ml.save(out_path)
+    json.dump(dict(ctx_frames=ctx, new_frames=new, scales=scales), open(out_path + ".scales.json", "w"), indent=1)
+    return ml
+
+
+def main():
+    import argparse
+    p = argparse.ArgumentParser(description="Liquid-Codec decoder reimplementation and Core ML conversion")
+    p.add_argument("mode", choices=["check", "convert"])
+    p.add_argument("model_dir")
+    p.add_argument("out", nargs="?")
+    p.add_argument("--ctx", type=int, default=CTX)
+    p.add_argument("--new", type=int, default=NEW)
+    p.add_argument("--report", default="")
+    a = p.parse_args()
+    if a.mode == "check":
+        res = check_decoder(a.model_dir, a.ctx, a.new)
+        print(json.dumps(res, indent=1))
+        json.dump(res, open(a.report or "check.json", "w"), indent=1)
+    else:
+        if not a.out:
+            p.error("convert needs OUT.mlpackage")
+        scales = None
+        if a.report and os.path.exists(a.report):
+            scales = json.load(open(a.report)).get("scales")
+        elif os.path.exists("check.json"):
+            blob = json.load(open("check.json"))
+            if blob.get("ctx_frames", a.ctx) == a.ctx and blob.get("new_frames", a.new) == a.new:
+                scales = blob.get("scales")
+        convert_decoder(a.model_dir, a.out, a.ctx, a.new, scales)
+        print("SAVED", a.out)
 
 
 if __name__ == "__main__":

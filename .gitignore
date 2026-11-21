@@ -1,5 +1,7 @@
 __pycache__/
 .DS_Store
 *.mlpackage/
+# models/stream/*.mlpackage is the streaming encoder and the short decoder windows.
+# The pattern above ignores them; they are added with git add -f.
 out.wav
 codes.bin

@@ -1,0 +1,8 @@
+# Conversion and the PyTorch checks. Core ML prediction needs macOS; conversion itself runs here.
+torch
+numpy
+safetensors
+soundfile
+coremltools>=8
+transformers>=5.24
+huggingface_hub

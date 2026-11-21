@@ -3,10 +3,13 @@ Copyright (c) Liquid AI, Inc.
 https://huggingface.co/LiquidAI/Liquid-Codec (revision b5abfac46ef92275f191a52c41013315f237301d)
 Licensed under the LFM Open License v1.0 (LICENSE-LFM-Open-v1.0.txt). The upstream repository ships no NOTICE file of its own.
 
-This repository is a Derivative Work: a Core ML conversion of Liquid-Codec's decoder for the Apple Neural Engine.
-- models/lc_dec_ane_int8.mlmodelc, models/lc_dec_ane.mlmodelc, models/lc_tail_f32.bin: Liquid AI's decoder weights, converted (int8 and fp16 Core ML programs; float32 tail).
-- convert/lc_ane.py: modified re-implementation of Liquid AI's decoder modeling code (changes listed at the top of the file).
-- examples/, convert/export_tail.py: new code.
+This repository is a Derivative Work: a Core ML conversion of Liquid-Codec for Apple Silicon.
+- models/lc_dec_ane_int8.mlmodelc, models/lc_dec_ane.mlmodelc, models/lc_tail_f32.bin: Liquid AI's decoder weights, converted (int8 and fp16 Core ML programs; float32 tail). Fixed 40-frame window from the original conversion.
+- models/stream/: the same decoder weights re-converted for 1, 2, and 4 new frames (ctx=20), plus the encoder weights as a one-frame Core ML step with a key/value cache (fp16, and int8 on the LFM stack only). Produced by convert/build_models.py.
+- models/liquidcodec.json: manifest for the streaming packages (tensor names, cache length, latency).
+- convert/lc_ane.py: modified re-implementation of Liquid AI's decoder modeling code (changes listed at the top of the file). Parameterized chunk length.
+- convert/lc_enc.py, convert/lc_step.py: modified re-implementation of Liquid AI's encoder (STFT front end, full-causal LFM, finite-scalar quantizer) in the same ANE layout. Changes are listed at the top of each file.
+- convert/build_models.py, convert/export_tail.py, examples/: new code. The Swift example now streams encode and decode.
 Use of the models and weights here is under Liquid AI's LFM Open License v1.0, including its commercial-use limit (Section 5).
 
 Sample audio in samples/ is third-party: LibriTTS-R, AI4Bharat Rasa and Google FLEURS recordings, each CC-BY-4.0 (attribution in README.md, Samples).
